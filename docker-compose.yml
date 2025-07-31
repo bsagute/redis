@@ -1,0 +1,21 @@
+# docker-compose.yml
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    image: redis-go-app:latest
+    container_name: redis-demo-app
+    # if your Go app listens on a port, expose & map it here:
+    # ports:
+    #   - "8080:8080"
+    environment:
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      - redis
