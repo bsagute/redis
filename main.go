@@ -1,139 +1,142 @@
 package main
 
 import (
-	"context"       // for Redis context
-	"crypto/rand"   // for secure randomness
-	"encoding/json" // for JSON marshaling
+	"context"       // for passing context to Redis
+	"crypto/rand"   // for secure random numbers
+	"encoding/json" // for marshaling Record structs
 	"fmt"           // for formatted I/O
-	"log"           // for fatal logging
-	"math/big"      // for large random ints
+	"log"           // for logging fatal errors
+	"math/big"      // for large random-int ranges
 	"strings"       // for parsing INFO output
-	"time"          // for timing operations
+	"time"          // for measuring durations
 
 	"github.com/go-redis/redis/v8" // Redis client
-	"github.com/google/uuid"       // UUIDs for unique keys
+	"github.com/google/uuid"       // for generating UUIDs
 )
 
 var ctx = context.Background()
 
-// sampleCounts: how many records to insert & fetch in each test
+// sampleCounts defines the sizes of data sets to benchmark.
 var sampleCounts = []int{10, 100, 1_000, 10_000, 100_000}
 
-// Record is the data we store in Redis
+// Record is the data structure we'll store in Redis.
 type Record struct {
-	ID     string  `json:"id"`     // UUID (also used as key suffix)
-	Name   string  `json:"name"`   // random name
+	ID     string  `json:"id"`     // UUID used as part of the key
+	Name   string  `json:"name"`   // random 6-letter name
 	Email  string  `json:"email"`  // random email
-	Amount float64 `json:"amount"` // random amount
+	Amount float64 `json:"amount"` // random float amount
 }
 
 func main() {
-	// 1) Connect to Redis (localhost:6379, DB0)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 0})
+	// 1) Connect to Redis
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+		DB:   0,
+	})
 	defer rdb.Close()
 
-	// 2) Track keys for final cleanup
+	// Track all keys we insert, so cleanup can delete exactly them
 	var insertedKeys []string
 
-	// 3) Print table header
+	// Print table header
 	fmt.Println("Redis: pipeline vs Lua for GET + HGET")
-	fmt.Println("Count  | ΔMem (MB) | Direct        | Pipeline      | Lua")
-	fmt.Println("-------+-----------+---------------+---------------+--------------")
+	fmt.Println("Count   | ΔMem (MB) | Direct Fetch   | Pipeline Fetch | Lua Fetch")
+	fmt.Println("--------+-----------+----------------+----------------+-----------")
 
-	// prevKeys holds keys from previous iteration to delete before next test
-	var prevKeys []string
-
-	// 4) Loop through each test size
+	// 2) Loop through each test size
 	for _, n := range sampleCounts {
-		// 4a) Remove keys from previous test only
-		if len(prevKeys) > 0 {
-			if err := deleteInsertedKeys(rdb, prevKeys); err != nil {
-				log.Fatalf("cleanup before test for %d failed: %v", n, err)
-			}
+		// a) Flush DB before each run to isolate tests
+		if err := rdb.FlushDB(ctx).Err(); err != nil {
+			log.Fatalf("FLUSHDB failed: %v", err)
 		}
-		prevKeys = prevKeys[:0] // reset for this iteration
 
-		// 4b) Measure memory before inserting
+		// b) Measure memory before insertion
 		beforeBytes, _ := getMemory(rdb)
 
-		// 4c) Insert n records, tracking each key under "bench:<UUID>"
-		keys := make([]string, 0, n)
+		// c) Insert n records under two distinct keys per record:
+		//    - "bench:json:<UUID>" for SET/GET
+		//    - "bench:hash:<UUID>" for HSET/HGET
+		jsonKeys := make([]string, n)
+		hashKeys := make([]string, n)
 		for i := 0; i < n; i++ {
 			rec := generateRecord()
-			key := "bench:" + rec.ID
+			jsonKey := "bench:json:" + rec.ID
+			hashKey := "bench:hash:" + rec.ID
 
-			// a) Store whole record as JSON string
+			// Store full JSON under jsonKey
 			data, _ := json.Marshal(rec)
-			if err := rdb.Set(ctx, key, data, 0).Err(); err != nil {
-				log.Fatalf("SET failed: %v", err)
+			if err := rdb.Set(ctx, jsonKey, data, 0).Err(); err != nil {
+				log.Fatalf("SET failed for key %s: %v", jsonKey, err)
 			}
-			// b) Store only the email in a hash field
-			if err := rdb.HSet(ctx, key, "email", rec.Email).Err(); err != nil {
-				log.Fatalf("HSET failed: %v", err)
+			// Store only the email under hashKey
+			if err := rdb.HSet(ctx, hashKey, "email", rec.Email).Err(); err != nil {
+				log.Fatalf("HSET failed for key %s: %v", hashKey, err)
 			}
 
-			keys = append(keys, key)
-			prevKeys = append(prevKeys, key)
-			insertedKeys = append(insertedKeys, key)
+			// Track keys for fetch and cleanup
+			jsonKeys[i] = jsonKey
+			hashKeys[i] = hashKey
+			insertedKeys = append(insertedKeys, jsonKey, hashKey)
 		}
 
-		// 4d) Measure memory after inserting & compute delta
+		// d) Measure memory after insertion and compute delta
 		afterBytes, _ := getMemory(rdb)
-		deltaMB := float64(afterBytes-beforeBytes) / (1024 * 1024)
+		deltaMB := float64(afterBytes-beforeBytes) / 1024.0 / 1024.0
 
-		// 4e) Direct fetch: n × (GET + HGET)
+		// e) Direct fetch: n × (GET + HGET)
 		t0 := time.Now()
-		for _, key := range keys {
-			if _, err := rdb.Get(ctx, key).Result(); err != nil {
-				log.Fatalf("GET failed: %v", err)
+		for i := 0; i < n; i++ {
+			if _, err := rdb.Get(ctx, jsonKeys[i]).Result(); err != nil {
+				log.Fatalf("Direct GET failed: %v", err)
 			}
-			if _, err := rdb.HGet(ctx, key, "email").Result(); err != nil {
-				log.Fatalf("HGET failed: %v", err)
+			if _, err := rdb.HGet(ctx, hashKeys[i], "email").Result(); err != nil {
+				log.Fatalf("Direct HGET failed: %v", err)
 			}
 		}
 		durDirect := time.Since(t0)
 
-		// 4f) Pipeline fetch: batch GET + HGET
+		// f) Pipeline fetch: batch GET + HGET in a single round-trip
 		t1 := time.Now()
 		pipe := rdb.Pipeline()
-		for _, key := range keys {
-			pipe.Get(ctx, key)
-			pipe.HGet(ctx, key, "email")
+		for i := 0; i < n; i++ {
+			pipe.Get(ctx, jsonKeys[i])
+			pipe.HGet(ctx, hashKeys[i], "email")
 		}
 		if _, err := pipe.Exec(ctx); err != nil {
 			log.Fatalf("Pipeline exec failed: %v", err)
 		}
 		durPipe := time.Since(t1)
 
-		// 4g) Lua script fetch: server‐side atomic GET+HGET
-		lua := redis.NewScript(`
+		// g) Lua fetch: server-side atomic GET + HGET
+		luaScript := redis.NewScript(`
             local res = {}
-            for _, k in ipairs(ARGV) do
-                local v = redis.call("GET", k)
-                local e = redis.call("HGET", k, "email")
+            for i=1,#KEYS do
+                local v = redis.call("GET", KEYS[i])
+                local e = redis.call("HGET", ARGV[i], "email")
                 table.insert(res, {v, e})
             end
             return res
         `)
 		t2 := time.Now()
-		if _, err := lua.Run(ctx, rdb, nil, keys).Result(); err != nil {
+		if _, err := luaScript.Run(ctx, rdb, jsonKeys, hashKeys).Result(); err != nil {
 			log.Fatalf("Lua script failed: %v", err)
 		}
 		durLua := time.Since(t2)
 
-		// 4h) Print results row
-		fmt.Printf("%6d | %+7.2f   | %13v | %13v | %12v\n",
-			n, deltaMB, durDirect, durPipe, durLua)
+		// h) Print results for this batch size
+		fmt.Printf("%6d | %+9.2f | %14v | %14v | %10v\n",
+			n, deltaMB, durDirect, durPipe, durLua,
+		)
 	}
 
-	// 5) Final cleanup: delete exactly our "bench:" keys
+	// 3) Final cleanup: delete exactly the keys we inserted (no others)
 	if err := deleteInsertedKeys(rdb, insertedKeys); err != nil {
-		log.Fatalf("final cleanup failed: %v", err)
+		log.Fatalf("Final cleanup failed: %v", err)
 	}
 	fmt.Println("✅ Cleanup complete: only bench:* keys removed")
 }
 
-// getMemory reads Redis INFO memory and returns bytes & human string.
+// getMemory returns Redis's used_memory (bytes) and used_memory_human.
 func getMemory(rdb *redis.Client) (bytes int64, human string) {
 	info, err := rdb.Info(ctx, "memory").Result()
 	if err != nil {
@@ -151,7 +154,8 @@ func getMemory(rdb *redis.Client) (bytes int64, human string) {
 	return
 }
 
-// deleteInsertedKeys deletes only the provided list of keys, in batches.
+// deleteInsertedKeys deletes exactly the given keys in batches,
+// ensuring no other keys in Redis are touched.
 func deleteInsertedKeys(rdb *redis.Client, keys []string) error {
 	const batchSize = 1000
 	for i := 0; i < len(keys); i += batchSize {
@@ -160,23 +164,23 @@ func deleteInsertedKeys(rdb *redis.Client, keys []string) error {
 			end = len(keys)
 		}
 		if err := rdb.Del(ctx, keys[i:end]...).Err(); err != nil {
-			return fmt.Errorf("del batch %d–%d: %w", i, end, err)
+			return fmt.Errorf("failed deleting keys %d–%d: %w", i, end, err)
 		}
 	}
 	return nil
 }
 
-// generateRecord creates a Record with random data.
+// generateRecord creates a random Record for testing.
 func generateRecord() Record {
 	return Record{
-		ID:     uuid.New().String(),                       // unique id
-		Name:   randStr(6),                                // random name
-		Email:  fmt.Sprintf("%s@example.com", randStr(8)), // random email
-		Amount: float64(randInt(100, 99999)),              // random amount
+		ID:     uuid.New().String(),
+		Name:   randStr(6),
+		Email:  fmt.Sprintf("%s@example.com", randStr(8)),
+		Amount: float64(randInt(100, 99999)),
 	}
 }
 
-// randStr returns a random lowercase string of length n.
+// randStr returns a random string of lowercase letters of length n.
 func randStr(n int) string {
 	letters := "abcdefghijklmnopqrstuvwxyz"
 	buf := make([]byte, n)
@@ -187,7 +191,7 @@ func randStr(n int) string {
 	return string(buf)
 }
 
-// randInt returns a random integer [min, max).
+// randInt returns a random int in [min, max).
 func randInt(min, max int) int {
 	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
 	return int(n.Int64()) + min
