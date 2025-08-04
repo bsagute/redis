@@ -1,304 +1,194 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"crypto/rand"
-	"encoding/csv"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"math"
-	"math/big"
-	"os"
-	"strconv"
-	"strings"
-	"time"
+	"context"       // for Redis context
+	"crypto/rand"   // for secure randomness
+	"encoding/json" // for JSON marshaling
+	"fmt"           // for formatted I/O
+	"log"           // for fatal logging
+	"math/big"      // for large random ints
+	"strings"       // for parsing INFO output
+	"time"          // for timing operations
 
-	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
+	"github.com/go-redis/redis/v8" // Redis client
+	"github.com/google/uuid"       // UUIDs for unique keys
 )
 
+var ctx = context.Background()
+
+// sampleCounts: how many records to insert & fetch in each test
+var sampleCounts = []int{10, 100, 1_000, 10_000, 100_000}
+
+// Record is the data we store in Redis
 type Record struct {
-	ID     string  `json:"id"`
-	Name   string  `json:"name"`
-	Email  string  `json:"email"`
-	Amount float64 `json:"amount"`
+	ID     string  `json:"id"`     // UUID (also used as key suffix)
+	Name   string  `json:"name"`   // random name
+	Email  string  `json:"email"`  // random email
+	Amount float64 `json:"amount"` // random amount
 }
-
-const (
-	csvFile   = "dummy_data.csv"
-	totalRows = 100_000
-	batchSize = 1_000
-)
 
 func main() {
-	// 1) Generate dummy CSV
-	fmt.Println("📝 Generating CSV...")
-	t0 := time.Now()
-	if err := generateCSV(csvFile, totalRows); err != nil {
-		log.Fatalf("CSV generation failed: %v", err)
-	}
-	fmt.Printf("🏁 CSV generated in %v\n\n", time.Since(t0))
+	// 1) Connect to Redis (localhost:6379, DB0)
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 0})
+	defer rdb.Close()
 
-	// 2) Load records into memory once
-	records, err := loadRecords(csvFile)
-	if err != nil {
-		log.Fatalf("Failed to load CSV: %v", err)
-	}
+	// 2) Track keys for final cleanup
+	var insertedKeys []string
 
-	// 3) Connect to Redis
-	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 0})
-	defer client.Close()
+	// 3) Print table header
+	fmt.Println("Redis: pipeline vs Lua for GET + HGET")
+	fmt.Println("Count  | ΔMem (MB) | Direct        | Pipeline      | Lua")
+	fmt.Println("-------+-----------+---------------+---------------+--------------")
 
-	// 4) Run each approach
-	runSetGet(ctx, client, records)
-	fmt.Println()
-	runMSetMGet(ctx, client, records, batchSize)
-	fmt.Println()
-	runHSetHGetAll(ctx, client, records, batchSize)
-}
+	// prevKeys holds keys from previous iteration to delete before next test
+	var prevKeys []string
 
-// ---------------- CSV Generation & Loading ----------------
-
-func generateCSV(filename string, count int) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(f)
-	w.Write([]string{"id", "name", "email", "amount"})
-	for i := 0; i < count; i++ {
-		id := uuid.New().String()
-		name := fmt.Sprintf("%s %s", randStr(5), randStr(7))
-		email := fmt.Sprintf("%s@%s.com", randStr(6), randStr(5))
-		amt := math.Round(randFloat()*10000*100) / 100
-		w.Write([]string{id, name, email, fmt.Sprintf("%.2f", amt)})
-		if i%10000 == 0 {
-			w.Flush()
-			if err := w.Error(); err != nil {
-				return err
+	// 4) Loop through each test size
+	for _, n := range sampleCounts {
+		// 4a) Remove keys from previous test only
+		if len(prevKeys) > 0 {
+			if err := deleteInsertedKeys(rdb, prevKeys); err != nil {
+				log.Fatalf("cleanup before test for %d failed: %v", n, err)
 			}
 		}
-	}
-	w.Flush()
-	return w.Error()
-}
+		prevKeys = prevKeys[:0] // reset for this iteration
 
-func randStr(n int) string {
-	letters := "abcdefghijklmnopqrstuvwxyz"
-	out := make([]byte, n)
-	for i := range out {
-		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-		out[i] = letters[idx.Int64()]
-	}
-	return string(out)
-}
+		// 4b) Measure memory before inserting
+		beforeBytes, _ := getMemory(rdb)
 
-func randFloat() float64 {
-	n, _ := rand.Int(rand.Reader, big.NewInt(1e9))
-	return float64(n.Int64()) / 1e9
-}
+		// 4c) Insert n records, tracking each key under "bench:<UUID>"
+		keys := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			rec := generateRecord()
+			key := "bench:" + rec.ID
 
-func loadRecords(filename string) ([]Record, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+			// a) Store whole record as JSON string
+			data, _ := json.Marshal(rec)
+			if err := rdb.Set(ctx, key, data, 0).Err(); err != nil {
+				log.Fatalf("SET failed: %v", err)
+			}
+			// b) Store only the email in a hash field
+			if err := rdb.HSet(ctx, key, "email", rec.Email).Err(); err != nil {
+				log.Fatalf("HSET failed: %v", err)
+			}
 
-	r := csv.NewReader(bufio.NewReader(f))
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	var recs []Record
-	for {
-		row, err := r.Read()
-		if err == io.EOF {
-			break
+			keys = append(keys, key)
+			prevKeys = append(prevKeys, key)
+			insertedKeys = append(insertedKeys, key)
 		}
-		if err != nil {
-			return nil, err
+
+		// 4d) Measure memory after inserting & compute delta
+		afterBytes, _ := getMemory(rdb)
+		deltaMB := float64(afterBytes-beforeBytes) / (1024 * 1024)
+
+		// 4e) Direct fetch: n × (GET + HGET)
+		t0 := time.Now()
+		for _, key := range keys {
+			if _, err := rdb.Get(ctx, key).Result(); err != nil {
+				log.Fatalf("GET failed: %v", err)
+			}
+			if _, err := rdb.HGet(ctx, key, "email").Result(); err != nil {
+				log.Fatalf("HGET failed: %v", err)
+			}
 		}
-		amt, _ := strconv.ParseFloat(row[3], 64)
-		recs = append(recs, Record{
-			ID:     row[0],
-			Name:   row[1],
-			Email:  row[2],
-			Amount: amt,
-		})
+		durDirect := time.Since(t0)
+
+		// 4f) Pipeline fetch: batch GET + HGET
+		t1 := time.Now()
+		pipe := rdb.Pipeline()
+		for _, key := range keys {
+			pipe.Get(ctx, key)
+			pipe.HGet(ctx, key, "email")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Fatalf("Pipeline exec failed: %v", err)
+		}
+		durPipe := time.Since(t1)
+
+		// 4g) Lua script fetch: server‐side atomic GET+HGET
+		lua := redis.NewScript(`
+            local res = {}
+            for _, k in ipairs(ARGV) do
+                local v = redis.call("GET", k)
+                local e = redis.call("HGET", k, "email")
+                table.insert(res, {v, e})
+            end
+            return res
+        `)
+		t2 := time.Now()
+		if _, err := lua.Run(ctx, rdb, nil, keys).Result(); err != nil {
+			log.Fatalf("Lua script failed: %v", err)
+		}
+		durLua := time.Since(t2)
+
+		// 4h) Print results row
+		fmt.Printf("%6d | %+7.2f   | %13v | %13v | %12v\n",
+			n, deltaMB, durDirect, durPipe, durLua)
 	}
-	return recs, nil
+
+	// 5) Final cleanup: delete exactly our "bench:" keys
+	if err := deleteInsertedKeys(rdb, insertedKeys); err != nil {
+		log.Fatalf("final cleanup failed: %v", err)
+	}
+	fmt.Println("✅ Cleanup complete: only bench:* keys removed")
 }
 
-// ---------------- Redis Helpers ----------------
-
-func flushDB(ctx context.Context, client *redis.Client) {
-	if err := client.FlushDB(ctx).Err(); err != nil {
-		log.Fatalf("FlushDB failed: %v", err)
-	}
-}
-
-func getMemStats(ctx context.Context, client *redis.Client) (usedBytes int64, usedHuman string) {
-	info, err := client.Info(ctx, "memory").Result()
+// getMemory reads Redis INFO memory and returns bytes & human string.
+func getMemory(rdb *redis.Client) (bytes int64, human string) {
+	info, err := rdb.Info(ctx, "memory").Result()
 	if err != nil {
-		log.Fatalf("Failed to INFO memory: %v", err)
+		log.Fatalf("INFO memory failed: %v", err)
 	}
 	for _, line := range strings.Split(info, "\n") {
 		if strings.HasPrefix(line, "used_memory:") {
-			parts := strings.SplitN(line, ":", 2)
-			usedBytes, _ = strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+			fmt.Sscanf(line, "used_memory:%d", &bytes)
 		}
 		if strings.HasPrefix(line, "used_memory_human:") {
 			parts := strings.SplitN(line, ":", 2)
-			usedHuman = strings.TrimSpace(parts[1])
+			human = strings.TrimSpace(parts[1])
 		}
 	}
 	return
 }
 
-// ---------------- Approach 1: SET / GET ----------------
-
-func runSetGet(ctx context.Context, client *redis.Client, recs []Record) {
-	fmt.Println("=== Approach 1: SET & GET ===")
-	flushDB(ctx, client)
-	beforeBytes, beforeHuman := getMemStats(ctx, client)
-
-	// Write (SET)
-	t0 := time.Now()
-	for _, r := range recs {
-		data, _ := json.Marshal(r)
-		if err := client.Set(ctx, r.ID, data, 0).Err(); err != nil {
-			log.Fatalf("SET failed: %v", err)
+// deleteInsertedKeys deletes only the provided list of keys, in batches.
+func deleteInsertedKeys(rdb *redis.Client, keys []string) error {
+	const batchSize = 1000
+	for i := 0; i < len(keys); i += batchSize {
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		if err := rdb.Del(ctx, keys[i:end]...).Err(); err != nil {
+			return fmt.Errorf("del batch %d–%d: %w", i, end, err)
 		}
 	}
-	writeDur := time.Since(t0)
-	afterBytes, afterHuman := getMemStats(ctx, client)
-	deltaMB := float64(afterBytes-beforeBytes) / 1024 / 1024
-	fmt.Printf("Write SET  : %v | Mem %s → %s (+%.2f MB)\n",
-		writeDur, beforeHuman, afterHuman, deltaMB)
-
-	// Read (GET)
-	t1 := time.Now()
-	for _, r := range recs {
-		if _, err := client.Get(ctx, r.ID).Result(); err != nil {
-			log.Fatalf("GET failed: %v", err)
-		}
-	}
-	fmt.Printf("Read GET   : %v\n", time.Since(t1))
+	return nil
 }
 
-// ---------------- Approach 2: MSET / MGET ----------------
-
-func runMSetMGet(ctx context.Context, client *redis.Client, recs []Record, batch int) {
-	fmt.Println("=== Approach 2: MSET & MGET ===")
-	flushDB(ctx, client)
-	beforeBytes, beforeHuman := getMemStats(ctx, client)
-
-	// Write (MSET in batches)
-	t0 := time.Now()
-	args := make([]interface{}, 0, batch*2)
-	for i, r := range recs {
-		data, _ := json.Marshal(r)
-		args = append(args, r.ID, data)
-		if (i+1)%batch == 0 {
-			if err := client.MSet(ctx, args...).Err(); err != nil {
-				log.Fatalf("MSET failed: %v", err)
-			}
-			args = args[:0]
-		}
+// generateRecord creates a Record with random data.
+func generateRecord() Record {
+	return Record{
+		ID:     uuid.New().String(),                       // unique id
+		Name:   randStr(6),                                // random name
+		Email:  fmt.Sprintf("%s@example.com", randStr(8)), // random email
+		Amount: float64(randInt(100, 99999)),              // random amount
 	}
-	if len(args) > 0 {
-		if err := client.MSet(ctx, args...).Err(); err != nil {
-			log.Fatalf("MSET tail failed: %v", err)
-		}
-	}
-	writeDur := time.Since(t0)
-	afterBytes, afterHuman := getMemStats(ctx, client)
-	deltaMB := float64(afterBytes-beforeBytes) / 1024 / 1024
-	fmt.Printf("Write MSET : %v | Mem %s → %s (+%.2f MB)\n",
-		writeDur, beforeHuman, afterHuman, deltaMB)
-
-	// Read (MGET in batches)
-	t1 := time.Now()
-	keys := make([]string, 0, batch)
-	for i, r := range recs {
-		keys = append(keys, r.ID)
-		if (i+1)%batch == 0 {
-			if _, err := client.MGet(ctx, keys...).Result(); err != nil {
-				log.Fatalf("MGET failed: %v", err)
-			}
-			keys = keys[:0]
-		}
-	}
-	if len(keys) > 0 {
-		if _, err := client.MGet(ctx, keys...).Result(); err != nil {
-			log.Fatalf("MGET tail failed: %v", err)
-		}
-	}
-	fmt.Printf("Read MGET  : %v\n", time.Since(t1))
 }
 
-// ---------------- Approach 3: HSET / HGETALL ----------------
+// randStr returns a random lowercase string of length n.
+func randStr(n int) string {
+	letters := "abcdefghijklmnopqrstuvwxyz"
+	buf := make([]byte, n)
+	for i := range buf {
+		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		buf[i] = letters[idx.Int64()]
+	}
+	return string(buf)
+}
 
-func runHSetHGetAll(ctx context.Context, client *redis.Client, recs []Record, batch int) {
-	fmt.Println("=== Approach 3: HSET & HGETALL ===")
-	flushDB(ctx, client)
-	beforeBytes, beforeHuman := getMemStats(ctx, client)
-
-	// Write (HSET in pipeline batches)
-	t0 := time.Now()
-	pipe := client.Pipeline()
-	cnt := 0
-	for _, r := range recs {
-		key := "rec:" + r.ID
-		pipe.HSet(ctx, key,
-			"id", r.ID,
-			"name", r.Name,
-			"email", r.Email,
-			"amount", fmt.Sprintf("%.2f", r.Amount),
-		)
-		cnt++
-		if cnt%batch == 0 {
-			if _, err := pipe.Exec(ctx); err != nil {
-				log.Fatalf("HSET pipeline exec failed: %v", err)
-			}
-		}
-	}
-	if cnt%batch != 0 {
-		if _, err := pipe.Exec(ctx); err != nil {
-			log.Fatalf("HSET final exec failed: %v", err)
-		}
-	}
-	writeDur := time.Since(t0)
-	afterBytes, afterHuman := getMemStats(ctx, client)
-	deltaMB := float64(afterBytes-beforeBytes) / 1024 / 1024
-	fmt.Printf("Write HSET : %v | Mem %s → %s (+%.2f MB)\n",
-		writeDur, beforeHuman, afterHuman, deltaMB)
-
-	// Read (HGETALL in pipeline batches)
-	t1 := time.Now()
-	pipe = client.Pipeline()
-	cnt = 0
-	for _, r := range recs {
-		key := "rec:" + r.ID
-		pipe.HGetAll(ctx, key)
-		cnt++
-		if cnt%batch == 0 {
-			if _, err := pipe.Exec(ctx); err != nil {
-				log.Fatalf("HGETALL pipeline exec failed: %v", err)
-			}
-		}
-	}
-	if cnt%batch != 0 {
-		if _, err := pipe.Exec(ctx); err != nil {
-			log.Fatalf("HGETALL final exec failed: %v", err)
-		}
-	}
-	fmt.Printf("Read HGETALL: %v\n", time.Since(t1))
+// randInt returns a random integer [min, max).
+func randInt(min, max int) int {
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
+	return int(n.Int64()) + min
 }
